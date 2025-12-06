@@ -36,13 +36,28 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   
   const prevReqCount = useRef(0);
 
-  // Initial Session Check
+  // Initial Session Check with Timeout Safety
   useEffect(() => {
     let mounted = true;
     
     const initSession = async () => {
         try {
-            const { data: { session } } = await supabase.auth.getSession();
+            // Create a timeout promise to prevent infinite hanging (5 seconds)
+            const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Auth check timeout')), 5000)
+            );
+
+            // Race Supabase against the timeout
+            const result: any = await Promise.race([
+                supabase.auth.getSession(),
+                timeoutPromise
+            ]).catch(err => {
+                console.warn("Supabase connection issue:", err);
+                return { data: { session: null } }; // Fallback to no session
+            });
+            
+            const session = result?.data?.session;
+
             if (session?.user) {
                 const u = await DatabaseService.getUserById(session.user.id);
                 if (u && mounted) {
@@ -51,7 +66,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 }
             }
         } catch (error) {
-            console.error("Session check failed", error);
+            console.error("Auth init failed:", error);
         } finally {
             if (mounted) setIsLoading(false);
         }
@@ -61,9 +76,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
         if (session?.user) {
-            // We fetch the user data
-            const u = await DatabaseService.getUserById(session.user.id);
-            if(u && mounted) setUser(u);
+            // Only fetch if we don't have the user or the ID changed to avoid flashing/overwriting
+            if (!user || user.id !== session.user.id) {
+                const u = await DatabaseService.getUserById(session.user.id);
+                if(u && mounted) setUser(u);
+            }
         } else {
             if (mounted) setUser(null);
         }
@@ -76,8 +93,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, []);
 
   const loadRequests = async (userId: string) => {
-      const reqs = await DatabaseService.getPendingRequests(userId);
-      setPendingRequests(reqs);
+      try {
+        const reqs = await DatabaseService.getPendingRequests(userId);
+        setPendingRequests(reqs);
+      } catch (e) {
+        // Silent fail for requests
+      }
   };
 
   // Polling for real-time updates
@@ -85,22 +106,26 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!user) return;
 
     const interval = setInterval(async () => {
-        // 1. Sync User Stats
-        const updatedUser = await DatabaseService.getUserById(user.id);
-        if (updatedUser && JSON.stringify(updatedUser.stats) !== JSON.stringify(user.stats)) {
-            setUser(updatedUser);
+        try {
+            // 1. Sync User Stats
+            const updatedUser = await DatabaseService.getUserById(user.id);
+            if (updatedUser && JSON.stringify(updatedUser.stats) !== JSON.stringify(user.stats)) {
+                setUser(updatedUser);
+            }
+
+            // 2. Check Friend Requests
+            const reqs = await DatabaseService.getPendingRequests(user.id);
+            setPendingRequests(reqs);
+
+            if (reqs.length > prevReqCount.current) {
+                 showToast(`You have ${reqs.length} friend request(s)!`, 'info');
+            }
+            prevReqCount.current = reqs.length;
+        } catch (e) {
+            // Silent catch
         }
 
-        // 2. Check Friend Requests
-        const reqs = await DatabaseService.getPendingRequests(user.id);
-        setPendingRequests(reqs);
-
-        if (reqs.length > prevReqCount.current) {
-             showToast(`You have ${reqs.length} friend request(s)!`, 'info');
-        }
-        prevReqCount.current = reqs.length;
-
-    }, 3000); 
+    }, 15000); 
 
     return () => clearInterval(interval);
   }, [user, showToast]);
@@ -124,7 +149,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             return false;
         }
 
-        // Manually fetch user to ensure state is ready before navigation
         const u = await DatabaseService.getUserById(data.user.id);
         
         if (u) {
@@ -134,7 +158,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         } else {
             console.error("User authenticated but profile not found.");
             showToast("Profile missing. Contact support.", "error");
-            // Optional: Logout if profile is broken to prevent stuck state
             await supabase.auth.signOut();
             return false;
         }
@@ -143,14 +166,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         showToast("An unexpected error occurred", "error");
         return false;
     } finally {
-        setIsLoading(false); // ALWAYS RUNS
+        setIsLoading(false); 
     }
   };
 
   const register = async (data: Partial<User>) => {
     setIsLoading(true);
     try {
-        // 1. Register in Auth
         const { data: authData, error: authError } = await supabase.auth.signUp({
             email: data.email!,
             password: data.password!,
@@ -162,21 +184,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             return false;
         }
 
-        // 2. Create Profile in DB
-        const newUser: any = {
+        // 1. Create Profile in DB (Snake Case - как в базе данных)
+        const dbUser = {
             id: authData.user.id,
             email: data.email,
             username: data.username,
             full_name: data.fullName,
             avatar: '',
             is_online: true,
-            // Default values to prevent DB errors
             stats: { totalQuizzes: 0, totalScore: 0, totalQuestionsAnswered: 0, totalCorrect: 0 },
             enrolled_subjects: [],
             friends: []
         };
 
-        const { error: profileError } = await supabase.from('profiles').insert(newUser);
+        const { error: profileError } = await supabase.from('profiles').insert(dbUser);
 
         if (profileError) {
             console.error("Profile creation error:", profileError);
@@ -184,8 +205,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             return false;
         }
         
-        // 3. Update local state immediately
-        setUser(newUser);
+        // 2. Update Local State (Camel Case - как в приложении)
+        // Это предотвращает белый экран при доступе к enrolledSubjects
+        const localUser: User = {
+            id: authData.user.id,
+            email: data.email!,
+            username: data.username!,
+            fullName: data.fullName!, // camelCase
+            avatar: '',
+            isOnline: true, // camelCase
+            stats: { totalQuizzes: 0, totalScore: 0, totalQuestionsAnswered: 0, totalCorrect: 0 },
+            enrolledSubjects: [], // camelCase!
+            friends: []
+        };
+
+        setUser(localUser);
         return true;
 
     } catch (e) {
@@ -193,7 +227,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         showToast("An unexpected error occurred", "error");
         return false;
     } finally {
-        setIsLoading(false); // ALWAYS RUNS
+        setIsLoading(false); 
     }
   };
 
@@ -206,7 +240,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const updateProfile = async (data: Partial<User>) => {
     if (!user) return;
     const updated = { ...user, ...data };
-    setUser(updated); // Optimistic update
+    setUser(updated); 
     await DatabaseService.updateUser(updated);
   };
 
