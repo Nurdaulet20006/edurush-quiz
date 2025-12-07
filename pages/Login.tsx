@@ -81,7 +81,7 @@ export const Login: React.FC = () => {
             </div>
 
             <div className="relative z-10 text-sm font-medium text-primary-200">
-                © 2024 EduRush Platform. All rights reserved.
+                © 2025 EduRush Platform. All rights reserved.
             </div>
          </div>
 
